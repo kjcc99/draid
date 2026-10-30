@@ -3257,6 +3257,62 @@ function pickVariant(id) {
   return 1 + Math.floor(Math.random() * n);   // 1..n; Math.random = sound variant, not game RNG
 }
 let audioBase = null;
+// PERF: sound playback. Every effect used to be `new Audio(url).play()` — a fresh media element
+// (resource lookup + decoder pipeline) per sound, several per second while tracing a chain; on
+// phones that churn is a visible hitch and the sound itself starts late. Web Audio decodes each
+// file ONCE into an AudioBuffer and plays it from memory. The context is created/resumed inside
+// the first user gesture (autoplay policy); until a file is decoded, or where Web Audio or the
+// codec is missing (node tests, older Safari: no Vorbis), the old <audio> path plays it.
+// Presentation only — which sound plays and when is unchanged.
+let sfxCtx = null;
+const sfxBuf = new Map();   // url -> AudioBuffer | Promise | null (decode failed: use <audio>)
+function sfxUnlock() {
+  try {
+    if (!sfxCtx) {
+      const AC = typeof AudioContext === 'function' ? AudioContext
+        : (typeof webkitAudioContext === 'function' ? webkitAudioContext : null);
+      if (!AC) return;
+      sfxCtx = new AC();
+      sfxPreload();
+    }
+    if (sfxCtx.state === 'suspended') sfxCtx.resume().catch(() => {});
+  } catch (e) { sfxCtx = null; }
+}
+function sfxLoad(url) {
+  if (!sfxCtx || sfxBuf.has(url)) return;
+  sfxBuf.set(url, fetch(url).then(r => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
+    .then(ab => new Promise((ok, bad) => sfxCtx.decodeAudioData(ab, ok, bad)))
+    .then(buf => { sfxBuf.set(url, buf); }, () => { sfxBuf.set(url, null); }));
+}
+function sfxPreload() {
+  if (!sfxCtx || !audioBase) return;
+  for (let id = 0; id < SOUND_FILES.length; id++) {
+    if (!SOUND_FILES[id]) continue;
+    for (let v = 1; v <= (SOUND_VARIATIONS[id] || 1); v++) sfxLoad(audioBase + '/sounds/' + SOUND_FILES[id] + v + '.ogg');
+  }
+}
+function sfxPlay(url) {
+  const buf = sfxBuf.get(url);
+  if (sfxCtx && buf && !(buf instanceof Promise) && sfxCtx.state === 'running') {
+    try {
+      const src = sfxCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(sfxCtx.destination);   // S3 step 2: volume 1.0 (device-scaled)
+      src.start();
+      return;
+    } catch (e) { /* fall through to <audio> */ }
+  }
+  sfxLoad(url);
+  try {
+    const a = new Audio(url);
+    a.volume = 1.0;
+    a.play().catch(() => {});
+  } catch (e) { /* audio unavailable */ }
+}
+if (typeof document !== 'undefined' && document.addEventListener) {
+  for (const ev of ['pointerdown', 'keydown', 'touchend'])
+    document.addEventListener(ev, sfxUnlock, { capture: true, passive: true });
+}
 function drainSounds() {
   if (!api) return;
   // U13 review C: tips deferred while a FoldoutMenu panel was up flush here — the poll
@@ -3268,15 +3324,11 @@ function drainSounds() {
     if (!soundOn) continue;   // U12: one theme, ripped .ogg sounds (theme.sounds always true)
     const base = SOUND_FILES[s];
     if (!base) continue;
-    try {
-      // S3 step 2: volume 1.0 — the original plays at the device media-volume fraction
-      // (SoundEngine.playSound:57-62 = getStreamVolume(MUSIC)/getStreamMaxVolume(MUSIC), full
-      // scale for the app, scaled only by the device). The page's fixed 0.45 was invented; the
-      // browser/device volume now plays that role. S3 step 1: random variant 1..N.
-      const a = new Audio(audioBase + '/sounds/' + base + pickVariant(s) + '.ogg');
-      a.volume = 1.0;
-      a.play().catch(() => {});
-    } catch (e) {}
+    // S3 step 2: volume 1.0 — the original plays at the device media-volume fraction
+    // (SoundEngine.playSound:57-62 = getStreamVolume(MUSIC)/getStreamMaxVolume(MUSIC), full
+    // scale for the app, scaled only by the device). The page's fixed 0.45 was invented; the
+    // browser/device volume now plays that role. S3 step 1: random variant 1..N.
+    sfxPlay(audioBase + '/sounds/' + base + pickVariant(s) + '.ogg');
   }
 }
 
@@ -3309,11 +3361,7 @@ function playSoundId(id) {
   if (id < 0 || !soundOn) return;   // U12: ripped .ogg only
   const base = SOUND_FILES[id];
   if (!base) return;
-  try {
-    const a = new Audio(audioBase + '/sounds/' + base + pickVariant(id) + '.ogg');   // S3: random variant
-    a.volume = 1.0;                                                                  // S3 step 2: device-scaled
-    a.play().catch(() => {});
-  } catch (e) {}
+  sfxPlay(audioBase + '/sounds/' + base + pickVariant(id) + '.ogg');   // S3: random variant, device-scaled volume
 }
 
 // ---------------------------------------------------------------- art assets
@@ -3324,6 +3372,7 @@ async function loadThemeArt(t) {
   const forId = t.id;          // guard: a slow load must not clobber a newer theme switch
   art = null;
   audioBase = ASSET_BASE;
+  sfxPreload();   // PERF: decode the sound set now if a gesture already created the context
   try {
     const [sprites, tiles, menus, icons, font, fontMenu, fontScore] = await Promise.all([
       fetch(audioBase + '/sprites.json').then(r => r.json()),
@@ -3597,16 +3646,23 @@ function drawTintedSprite(dctx, img, sx, sy, sw, sh, dx, dy, dw, dh, rgb, alpha,
               ',' + pw + ',' + ph + ',' + (flip ? 1 : 0);
   let m = img._tintCache;
   if (!m) m = img._tintCache = new Map();
+  const hit = m.get(key);
+  if (hit) {
+    // PERF: blit the cached tint straight to the destination (it is already device-sized), instead
+    // of resizing the shared _tint scratch canvas and copying it through — a resize reallocates.
+    dctx.save();
+    dctx.globalAlpha = alpha;
+    dctx.drawImage(hit, dx, dy, dw, dh);
+    dctx.restore();
+    return;
+  }
   if (_tint.width !== pw || _tint.height !== ph) { _tint.width = pw; _tint.height = ph; }
   const c = _tint.getContext('2d');
   c.setTransform(1, 0, 0, 1, 0, 0);
   hdSmooth(c);
   c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
   c.clearRect(0, 0, pw, ph);
-  const cached = m.get(key);
-  if (cached) {
-    c.drawImage(cached, 0, 0);
-  } else {
+  {
     // F5: optional horizontal mirror (the score screen's LEFT page arrow is UV-mirrored in the
     // capture — emu_score_p1_state.json: u 329 -> 302 left-to-right). The mirror is baked into
     // the cached tint, so the blit below stays a plain one.
@@ -3652,12 +3708,20 @@ function drawTintedSprite(dctx, img, sx, sy, sw, sh, dx, dy, dw, dh, rgb, alpha,
 // so pre-multiply the green into a one-time tinted copy of tiles.png (F5c exact modulate:
 // modulateTintPixels over the readback, same as drawTintedSprite) and sample it with
 // per-triangle affine UV maps. Presentation only.
+// PERF: only the arrow's own corner of the atlas is copied and tinted — every Arrow UV lies in
+// u 270..326, v 364..380 (1x atlas px). Tinting the whole HD atlas (4096x4096 = 16.7 M texels
+// read back and multiplied on the main thread) stalled the page for seconds on the first chain
+// drag. ARROW_UV is the copied window with a 4 px margin so bilinear taps at the quad edges
+// still read the same neighbouring texels; _ox/_oy (atlas px) shift the UVs into it.
+const ARROW_UV = [266, 360, 64, 24];
 function arrowTintedAtlas(tiles) {
   if (tiles._arrowGreen) return tiles._arrowGreen;
+  const S = ASSET_SCALE, ox = ARROW_UV[0] * S, oy = ARROW_UV[1] * S;
   const cv = document.createElement('canvas');
-  cv.width = tiles.width; cv.height = tiles.height;
+  cv.width = ARROW_UV[2] * S; cv.height = ARROW_UV[3] * S;
+  cv._ox = ox; cv._oy = oy;
   const c = cv.getContext('2d');
-  c.drawImage(tiles, 0, 0);
+  c.drawImage(tiles, ox, oy, cv.width, cv.height, 0, 0, cv.width, cv.height);
   let px = null;
   try { px = c.getImageData(0, 0, cv.width, cv.height); } catch (e) { px = null; }   // tainted canvas (file://)
   if (px) {
@@ -3669,7 +3733,7 @@ function arrowTintedAtlas(tiles) {
     c.fillStyle = 'rgb(50,255,50)';
     c.fillRect(0, 0, cv.width, cv.height);
     c.globalCompositeOperation = 'destination-in';
-    c.drawImage(tiles, 0, 0);
+    c.drawImage(tiles, ox, oy, cv.width, cv.height, 0, 0, cv.width, cv.height);
     c.globalCompositeOperation = 'source-over';
   }
   tiles._arrowGreen = cv;
@@ -3692,7 +3756,7 @@ function drawArrowFan(dctx, img, q, al) {
       const S = ASSET_SCALE;
       strip = img._col270 = document.createElement('canvas');
       strip.width = S; strip.height = 7 * S;
-      strip.getContext('2d').drawImage(img, 270 * S, 364 * S, S, 7 * S, 0, 0, S, 7 * S);
+      strip.getContext('2d').drawImage(img, 270 * S - (img._ox || 0), 364 * S - (img._oy || 0), S, 7 * S, 0, 0, S, 7 * S);
     }
     const px = q[1][0] - q[0][0], py = q[1][1] - q[0][1];      // 2*HW*perp (v0->v1)
     const W2 = Math.hypot(px, py) || 1;
@@ -3717,9 +3781,10 @@ function drawArrowFan(dctx, img, q, al) {
     if (Math.abs(area) < 1e-6) continue;           // degenerate fan vertex (head base midpoint)
     // X3: quad UVs are 1x atlas px; the image is ASSET_SCALE times larger — scale the UV
     // space so the affine map (and drawImage(img,0,0) at natural size) line up.
-    const S = ASSET_SCALE;
-    const u0 = q[i][2] * S, v0 = q[i][3] * S, u1 = q[j][2] * S, v1 = q[j][3] * S,
-          u2 = q[k][2] * S, v2 = q[k][3] * S;
+    // PERF: img may be the cropped arrow window (arrowTintedAtlas) — shift by its origin.
+    const S = ASSET_SCALE, ox = img._ox || 0, oy = img._oy || 0;
+    const u0 = q[i][2] * S - ox, v0 = q[i][3] * S - oy, u1 = q[j][2] * S - ox, v1 = q[j][3] * S - oy,
+          u2 = q[k][2] * S - ox, v2 = q[k][3] * S - oy;
     const det = (u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0);
     if (Math.abs(det) < 1e-9) continue;
     const x0 = q[i][0], y0 = q[i][1], x1 = q[j][0], y1 = q[j][1], x2 = q[k][0], y2 = q[k][1];
@@ -4852,11 +4917,7 @@ function activateSkill(s) {
 // not game logic (AGENTS.md harness rule).
 function uiClick() {
   if (!soundOn) return;   // U12: ripped .ogg only
-  try {
-    const a = new Audio(audioBase + '/sounds/click' + pickVariant(0) + '.ogg');   // S3: click has 1 variant
-    a.volume = 1.0;                                                               // S3 step 2: device-scaled
-    a.play().catch(() => {});
-  } catch (e) { /* audio unavailable */ }
+  sfxPlay(audioBase + '/sounds/click' + pickVariant(0) + '.ogg');   // S3: click has 1 variant, device-scaled
 }
 
 // ---------------------------------------------------------------- HUD extras (W4c)
@@ -5859,7 +5920,55 @@ function makeFlare(colourKind, col, row, eye) {
            color: FLARE_COLORS[colourKind < 0 ? 4 : colourKind & 3] };
 }
 
+// SMOOTH: render interpolation. The timeline steps at the original's fixed 30 Hz (FX.DT), and
+// every rAF used to draw the latest step — so motion was 30 fps on any display, with uneven
+// 1/2/0-step frames on 60/120 Hz screens. lerpMark() stores each moving value's pre-step copy
+// before a step; lerpApply(k) draws the frame k (0..1) of the way from that copy to the stepped
+// value, then lerpRestore() puts the stepped values back. The steps themselves (timings, the
+// values the next step reads, everything the tests measure) are unchanged. Presentation only.
+let lerpGen = 0;
+const lerpSaved = [];
+function lerpMark(o, key, pkey) { o[pkey] = o[key]; o._lg = lerpGen; }
+function lerpMarkAll() {
+  lerpGen++;
+  for (const f of anim.falls) lerpMark(f, 'y', '_py');
+  for (const t of anim.tokens) { lerpMark(t, 'x', '_px'); lerpMark(t, 'y', '_py'); }
+  for (const ps of anim.particles) {
+    lerpMark(ps, 'timer', '_pt');
+    for (const q of ps.parts) { lerpMark(q, 'x', '_px'); lerpMark(q, 'y', '_py'); }
+  }
+  for (const fl of anim.flares) lerpMark(fl, 'age', '_pa');
+  for (const l of anim.labels) lerpMark(l, 'age', '_pa');
+  for (const l of liveLabels) lerpMark(l, 'age', '_pa');
+  for (const sh of anim.shards) lerpMark(sh, 't', '_pt');
+}
+function lerpOne(o, key, pkey, k) {
+  if (o._lg !== lerpGen || o[pkey] === undefined) return;   // spawned/stepped elsewhere: as is
+  lerpSaved.push(o, key, o[key]);
+  o[key] = o[pkey] + (o[key] - o[pkey]) * k;
+}
+function lerpApply(k, a) {
+  if (!(k < 1)) return;
+  if (a) {
+    for (const f of a.falls) lerpOne(f, 'y', '_py', k);
+    for (const t of a.tokens) { lerpOne(t, 'x', '_px', k); lerpOne(t, 'y', '_py', k); }
+    for (const ps of a.particles) {
+      lerpOne(ps, 'timer', '_pt', k);
+      for (const q of ps.parts) { lerpOne(q, 'x', '_px', k); lerpOne(q, 'y', '_py', k); }
+    }
+    for (const fl of a.flares) lerpOne(fl, 'age', '_pa', k);
+    for (const l of a.labels) lerpOne(l, 'age', '_pa', k);
+    for (const sh of a.shards) lerpOne(sh, 't', '_pt', k);
+  }
+  for (const l of liveLabels) lerpOne(l, 'age', '_pa', k);
+}
+function lerpRestore() {
+  for (let i = lerpSaved.length - 3; i >= 0; i -= 3) lerpSaved[i][lerpSaved[i + 1]] = lerpSaved[i + 2];
+  lerpSaved.length = 0;
+}
+
 function animStep() {
+  lerpMarkAll();
   for (const f of anim.falls) {
     const s = FX.fallStep(f.y, f.v, f.a, f.ty);
     f.y = s.y; f.v = s.v; f.landed = s.landed;
@@ -6121,7 +6230,7 @@ function hbStep() {
       hb.pulse = hb.pulseDur;                                       // +0x11c4 = Interpolate(0.5,0.3,t)
       hb.rest = 0;
       if (soundOn) {   // QueueSound 0x20 thump (ProcessHeartbeat bl @0x48ed2) — U12: ripped ogg
-        try { const a = new Audio(audioBase + '/sounds/heartbeat' + pickVariant(32) + '.ogg'); a.volume = 1.0; a.play().catch(() => {}); } catch (e) {}
+        sfxPlay(audioBase + '/sounds/heartbeat' + pickVariant(32) + '.ogg');
       }
     }
   }
@@ -6137,8 +6246,11 @@ function animTick(now) {
   if (anim.acc > 0.5) anim.acc = 0.5;   // a backgrounded tab does not fast-forward the timeline
   let steps = 0;
   while (anim.acc >= FX.DT && steps < 12) { animStep(); anim.acc -= FX.DT; steps++; }
-  draw();
-  drawFxLayer();
+  lerpApply(Math.min(1, anim.acc / FX.DT), anim);   // SMOOTH: draw between the last two steps
+  try {
+    draw();
+    drawFxLayer();
+  } finally { lerpRestore(); }
   // F5: unlock pop-up then banner, like Game::Render @0x25924:250,253 (both after the HUD)
   if (ukDraw) drawUnlockPopup(fxCtx, ukAlpha(performance.now()));
   if (helpDraw) drawHelpBanner(fxCtx, helpAlpha(performance.now()));
@@ -6170,6 +6282,7 @@ function animTick(now) {
     draw();
     if (cb) cb();
     startIdleLabels();
+    pendingPressTry();   // INPUT: a finger held through the animation starts its chain now
     return;
   }
   anim.raf = requestAnimationFrame(animTick);
@@ -6199,7 +6312,8 @@ function idleLabelTick(now) {
   if (idleAcc > 0.5) idleAcc = 0.5;   // a backgrounded tab does not fast-forward (animTick rule)
   let steps = 0;
   while (idleAcc >= FX.DT && steps < 12) {
-    for (const l of liveLabels) l.age += FX.DT;
+    lerpGen++;
+    for (const l of liveLabels) { lerpMark(l, 'age', '_pa'); l.age += FX.DT; }
     liveLabels = liveLabels.filter(l => l.age < FX.LABEL_LIFE);
     idleAcc -= FX.DT; steps++;
   }
@@ -6215,9 +6329,12 @@ function idleLabelTick(now) {
   fxCanvas.classList.add('on');
   fxCtx.setTransform(d, 0, 0, d, 0, 0);
   fxCtx.clearRect(0, 0, fxCanvas.width / d, fxCanvas.height / d);
-  drawLabelList(liveLabels);
-  helpPaint();
-  draw();   // tile-anchored survivors ride the board canvas (drawAnimLabels)
+  lerpApply(Math.min(1, idleAcc / FX.DT), null);   // SMOOTH: labels rise between steps too
+  try {
+    drawLabelList(liveLabels);
+    helpPaint();
+    draw();   // tile-anchored survivors ride the board canvas (drawAnimLabels)
+  } finally { lerpRestore(); }
   idleRaf = requestAnimationFrame(idleLabelTick);
 }
 
@@ -6905,8 +7022,12 @@ function helpAfterMove(chainTypes) {
 
 // ---------------------------------------------------------------- input
 // inner = true: only count the pointer when it is near the cell centre (radius HIT_R of a cell), so a
-// diagonal drag passes through the corner dead zone instead of picking up a side neighbour
-const HIT_R = 0.36;
+// diagonal drag passes through the corner dead zone instead of picking up a side neighbour.
+// INPUT: 0.45 (was 0.36). A straight diagonal passes 0.707 cells from the side neighbours' centres,
+// so 0.45 still leaves ~0.26 cell of sideways wobble on a diagonal, while a row/column trace no
+// longer has to stay within 0.36 of the centre line (a finger tracing slightly below centre —
+// the usual case, the finger hides the tile — used to skip cells: "it doesn't want to trace").
+const HIT_R = 0.45;
 function cellFromEvent(e, inner) {
   const rect = canvas.getBoundingClientRect();
   // A10: the canvas is 6 rows + the spawn runway — measure in cell px and skip
@@ -6945,19 +7066,50 @@ canvas.addEventListener('pointerdown', e => {
   // board width, tx=0.01 w=0.98, and N0 anchors at the pressed cell) while the tip queue
   // kept feeding new bubbles — the user-visible "tile swiping is broken".
   if (helpTap(e)) helpDismiss();
-  if (api.menu() >= 0 || api.over() || busy()) return;   // busy: tiles are falling (ProcessInput @0x330c0 gate)
+  if (api.menu() >= 0 || api.over()) return;
+  if (busy()) {
+    // busy: tiles are falling (ProcessInput @0x330c0 gate). INPUT: the original polls the held
+    // touch every frame, so a finger already down when the board settles still starts a chain;
+    // the page used to drop such a press outright — the chain then never started until the
+    // player lifted and pressed again. Hold the press and start it once the board settles
+    // (pendingPressTry: next pointermove, or the anim settle).
+    if (cellFromEvent(e)) {
+      e.preventDefault();
+      canvas.setPointerCapture(e.pointerId);
+      pendingPress = { id: e.pointerId, x: e.clientX, y: e.clientY, cx: e.clientX, cy: e.clientY };
+    }
+    return;
+  }
+  pendingPress = null;
   const cellHit = cellFromEvent(e);
   if (!cellHit || !pathOk([cellHit])) return;   // e.g. frozen tiles can't start a chain
   e.preventDefault();
   canvas.setPointerCapture(e.pointerId);
-  drag = { path: [cellHit], last: { x: e.clientX, y: e.clientY } };
+  beginDrag(cellHit, e.clientX, e.clientY);
+});
+function beginDrag(cellHit, x, y) {
+  drag = { path: [cellHit], last: { x, y } };
   playSoundId(tileStartId(cellHit.c, cellHit.r));   // S2 fix #1: QueueTileSound on press (ProcessInput @000330c0:143)
   queueHelp(0, (cellHit.c + 0.5) * FX.CELL, FX.center(cellHit.r));   // first chain start (HelpMenu tip 0, HUD.md §4); F5: the original anchors N0 at a
                               // arbitrary board tile (Process @0x339ac:98-101 RandI tile); this
                               // scaffold trigger passes the pressed cell instead (harness anchor)
   updatePreview();       // press runs UpdateCrossVisibility (ProcessInput @0x330c0:141)
   draw();
-});
+}
+// A press held while the board was busy: start its chain at the pressed cell once input opens,
+// then walk the finger's path since the press (same sub-stepping as pointermove).
+let pendingPress = null;
+function pendingPressTry() {
+  const pp = pendingPress;
+  if (!pp || drag || busy() || !api || api.menu() >= 0 || api.over()) return;
+  pendingPress = null;
+  const cellHit = cellFromEvent({ clientX: pp.x, clientY: pp.y });
+  if (!cellHit || !pathOk([cellHit])) return;
+  beginDrag(cellHit, pp.x, pp.y);
+  dragWalk(pp.cx, pp.cy);
+  updatePreview();
+  draw();
+}
 
 // Pointer samples can be far apart on a fast drag, so walk the segment from the previous sample in
 // small steps and feed each point through dragTo. A cell is appended only if the rebuild says the
@@ -6992,15 +7144,22 @@ function dragTo(x, y) {
   if (!skip) playSoundId(tileStartId(hit.c, hit.r));       // QueueTileSound(added tile) @0002c8dc:223
   p.push(hit);
 }
-canvas.addEventListener('pointermove', e => {
-  if (!drag || busy()) return;
-  e.preventDefault();
+function dragWalk(x, y) {
   const rect = canvas.getBoundingClientRect(), step = rect.width / 6 / 8;   // 1/8 cell
-  const from = drag.last || { x: e.clientX, y: e.clientY };
-  const dx = e.clientX - from.x, dy = e.clientY - from.y;
+  const from = drag.last || { x, y };
+  const dx = x - from.x, dy = y - from.y;
   const k = Math.max(1, Math.ceil(Math.hypot(dx, dy) / step));
   for (let i = 1; i <= k; i++) dragTo(from.x + dx * i / k, from.y + dy * i / k);
-  drag.last = { x: e.clientX, y: e.clientY };
+  drag.last = { x, y };
+}
+canvas.addEventListener('pointermove', e => {
+  if (pendingPress && e.pointerId === pendingPress.id) {
+    pendingPress.cx = e.clientX; pendingPress.cy = e.clientY;
+    pendingPressTry();
+  }
+  if (!drag || busy()) return;
+  e.preventDefault();
+  dragWalk(e.clientX, e.clientY);
   updatePreview();   // every drag add recomputes +0xc23c + crosses (ProcessTileSelection:384)
   draw();
 });
@@ -7052,8 +7211,8 @@ function endDrag() {
   finishAction();
 }
 let lastChainTypes = null, lastChainCell = null;
-canvas.addEventListener('pointerup', e => { e.preventDefault(); endDrag(); });
-canvas.addEventListener('pointercancel', () => { drag = null; draw(); });
+canvas.addEventListener('pointerup', e => { pendingPress = null; e.preventDefault(); endDrag(); });
+canvas.addEventListener('pointercancel', () => { pendingPress = null; drag = null; draw(); });
 
 // A15/A15e enemy tooltip — Original theme only. The original pops a BAND over the board when an
 // enemy tile is tapped (Interface::ProcessInput @000330c0:105 -> Tooltip::Show(this+0x5e38,
