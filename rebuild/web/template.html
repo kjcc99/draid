@@ -1517,6 +1517,41 @@ function hdSmooth(ctx) {
   if (ASSET_SCALE !== 1) ctx.imageSmoothingQuality = 'high';
   return ctx;
 }
+// PERF (HD): pre-shrunk sprite cache. The HD atlas is 4x the 1x art, so every board tile was a
+// high-quality DOWNSCALE from the 4096 px atlas on every frame (36+ per draw, and draw runs on
+// every pointermove and animation frame) — ~4x the raster cost of a 1:1 blit. drawScaled
+// shrinks each (image, source rect, device size) once into a canvas of exactly the destination's
+// device pixels and blits that. Same filter as before, run once. Only shrinks, only HD (the
+// normal build keeps its nearest-neighbour 1:1 pixels), only axis-aligned transforms; anything
+// else takes the plain drawImage. LRU-evicted by pixel count. Presentation only.
+const scaledCache = new Map();
+let scaledPx = 0, scaledSeq = 0;
+const SCALED_MAX_PX = 6291456;   // 24 MB of RGBA
+function drawScaled(dctx, img, sx, sy, sw, sh, dx, dy, dw, dh) {
+  const m = ASSET_SCALE !== 1 && typeof dctx.getTransform === 'function' ? dctx.getTransform() : null;
+  const pw = m ? Math.round(dw * m.a) : 0, ph = m ? Math.round(dh * m.d) : 0;
+  if (!m || m.b || m.c || pw < 1 || ph < 1 || pw >= sw || ph >= sh) {
+    dctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+    return;
+  }
+  const key = (img._scaledId || (img._scaledId = ++scaledSeq)) + ',' + sx + ',' + sy + ',' + sw + ',' + sh + ',' + pw + ',' + ph;
+  let cv = scaledCache.get(key);
+  if (cv) {
+    scaledCache.delete(key);   // LRU: move to the newest end
+  } else {
+    cv = document.createElement('canvas');
+    cv.width = pw; cv.height = ph;
+    hdSmooth(cv.getContext('2d')).drawImage(img, sx, sy, sw, sh, 0, 0, pw, ph);
+    scaledPx += pw * ph;
+    while (scaledPx > SCALED_MAX_PX && scaledCache.size) {
+      const [k0, old] = scaledCache.entries().next().value;
+      scaledCache.delete(k0);
+      scaledPx -= old.width * old.height;
+    }
+  }
+  scaledCache.set(key, cv);
+  dctx.drawImage(cv, dx, dy, dw, dh);
+}
 /* X7 (presentation only — no game logic): seam-free 9-slice / strip blits. Once the HD
    path smooths the 4x atlas (X6 turned imageSmoothing on for ASSET_SCALE>1) two artifacts
    appear AT EVERY SLICE JOIN of a multi-piece panel:
@@ -3886,10 +3921,10 @@ function drawTile(x, y, packed, tc, tr) {
         const gtex = art.tex[g.tex] || art.tex.tiles;
         const [gx, gy, gw, gh] = spriteSrc(g);
         const gs = cell * 1.497;
-        ctx.drawImage(gtex, gx, gy, gw, gh, x + (cell - gs) / 2, y + (cell - gs) / 2, gs, gs);
+        drawScaled(ctx, gtex, gx, gy, gw, gh, x + (cell - gs) / 2, y + (cell - gs) / 2, gs, gs);
       }
     }
-    ctx.drawImage(tex, sx, sy, fw, fh, x + pad, y + pad, s, s);
+    drawScaled(ctx, tex, sx, sy, fw, fh, x + pad, y + pad, s, s);
     // A16: overlay alphas from the decomp: flame quad alpha 200 (SetFlameVisibility @00062de8:36),
     // freeze quad alpha 255 (SetFreezeVisibility @00062e94:29). presentation only.
     if (frozen) drawOverlay('tile/frozen_overlay', x, y, pad, s, 255);
@@ -4132,7 +4167,7 @@ function drawOverlay(key, x, y, pad, s, alpha) {
   const tex = art.tex[spr.tex] || art.tex.tiles;
   const [sx, sy, sw, sh] = spriteSrc(spr);
   if (alpha !== undefined && alpha < 255) ctx.globalAlpha = alpha / 255;
-  ctx.drawImage(tex, sx, sy, sw, sh, x + pad, y + pad, s, s);
+  drawScaled(ctx, tex, sx, sy, sw, sh, x + pad, y + pad, s, s);
   if (alpha !== undefined && alpha < 255) ctx.globalAlpha = 1;
 }
 
@@ -7942,6 +7977,7 @@ function fontNumWidth(text) {
 // unit. centerX: label.x = x - width*scale/2 (the original's centred HUD labels, e.g.
 // UpdateSkullValue @0x488cc: x = 0.33125 + label+0x44 * 0.09 * -0.5). Returns false when
 // the ripped font is absent (caller keeps its fallback).
+const fontStripCache = new Map();   // PERF: finished number strips (fontNumDraw)
 function fontNumDraw(ctx, text, x, y, scale, color, ppu, centerX, exact) {
   if (!FONT_ROW) return false;
   text = String(text);
@@ -7980,10 +8016,20 @@ function fontNumDraw(ctx, text, x, y, scale, color, ppu, centerX, exact) {
   if (!items.length) return true;
   const bx = Math.floor(minX) - 1, by = Math.floor(minY) - 1;
   const bw = Math.ceil(maxX) - bx + 1, bh = Math.ceil(maxY) - by + 1;
-  const cv = document.createElement('canvas');
   // X6: the strip is blitted 1:1 into ctx (which runs under setTransform(dpr|R)) — give it
   // the same backing scale; glyph dests are NOT rounded at R>1.
   const R = hdCtxR(ctx);
+  // PERF: the finished strip depends only on these inputs (x/y enter as offsets from bx/by), so
+  // reuse it — the board redraws every enemy's 3-4 numbers on every frame and pointermove, and
+  // each used to allocate a fresh canvas + context. Same pixels; LRU-capped.
+  const key = text + '|' + scale + '|' + color + '|' + s + '|' + R + '|' + (exact ? 1 : 0) + '|' + (x - bx) + '|' + (y - by);
+  const hit = fontStripCache.get(key);
+  if (hit) {
+    fontStripCache.delete(key); fontStripCache.set(key, hit);
+    ctx.drawImage(hit, bx, by, bw, bh);
+    return true;
+  }
+  const cv = document.createElement('canvas');
   const c2 = hdCv(cv, bw, bh, R);
   const q = R > 1 ? (v => v) : Math.round;
   for (const [g, m, p] of items) {
@@ -7997,6 +8043,8 @@ function fontNumDraw(ctx, text, x, y, scale, color, ppu, centerX, exact) {
   c2.fillRect(0, 0, bw, bh);
   c2.globalCompositeOperation = 'source-over';
   ctx.drawImage(cv, bx, by, bw, bh);   // X6: R-backed strip, dest in ctx user units
+  fontStripCache.set(key, cv);
+  if (fontStripCache.size > 512) fontStripCache.delete(fontStripCache.keys().next().value);
   return true;
 }
 // F1: SimpleLabel NUMBER glyphs = tiles.png digit rects (NOT font.fnt — Game::Render
