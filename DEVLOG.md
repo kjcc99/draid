@@ -10,8 +10,8 @@ still open, so a later session can pick up without re-deriving it.
 |---|---|
 | Upstream base | `kaiyoti/open-dungeon-raid@e81efcf` (imported 2026-10-30 as `b97989e`, history not carried over) |
 | Default branch | `master` (the Pages workflow triggers on `main` or `master`) |
-| GitHub Pages | **Not live yet.** Runs #1 and #2 built fine but failed at deploy with a 404 because Pages was not enabled. Fix: *Settings → Pages → Source: GitHub Actions*, then *Actions → Deploy GitHub Pages → Run workflow*. |
-| Expected URLs | Original <https://kjcc99.github.io/draid/> · HD <https://kjcc99.github.io/draid/hd/> |
+| GitHub Pages | **Live** since run #3 (manual dispatch, 2026-10-30 16:12 UTC, commit `544657a`). Every push to `master` redeploys. Runs #1 and #2 built fine but failed at deploy with a 404 because Pages was not enabled yet. |
+| URLs | Original <https://kjcc99.github.io/draid/> · HD <https://kjcc99.github.io/draid/hd/> |
 | Tests | 18/18 `rebuild/web/test_*.js` pass; `test_u16.py` and `test_u17.py` pass (see *Testing* below) |
 | Real-device check | **Not done.** All measurements so far are headless Chromium on a desktop CPU. |
 

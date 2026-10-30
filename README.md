@@ -15,7 +15,6 @@ HTML/JS page, and an optional Android WebView wrapper.
 
 **▶ Play in your browser (this fork):** [kjcc99.github.io/draid](https://kjcc99.github.io/draid/)
 · [HD version](https://kjcc99.github.io/draid/hd/)
-(GitHub Pages deployment is being set up; see the DEVLOG status table)
 · **Upstream:** [kaiyoti.github.io/open-dungeon-raid](https://kaiyoti.github.io/open-dungeon-raid/)
 · [HD](https://kaiyoti.github.io/open-dungeon-raid/hd/)
 · Android APKs (upstream builds, without this fork's changes): [Releases](https://github.com/kaiyoti/open-dungeon-raid/releases/latest)
