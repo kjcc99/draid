@@ -5,9 +5,20 @@ trace chains of tiles, level your classes, survive) that keeps it running on mod
 browsers and Android devices. C++ game core compiled to WebAssembly, a self-contained
 HTML/JS page, and an optional Android WebView wrapper.
 
-**▶ Play in your browser:** [kaiyoti.github.io/open-dungeon-raid](https://kaiyoti.github.io/open-dungeon-raid/)
-· [HD version](https://kaiyoti.github.io/open-dungeon-raid/hd/)
-· Android APKs: [Releases](https://github.com/kaiyoti/open-dungeon-raid/releases/latest)
+> ### About this fork
+> **kjcc99/draid** is a fork of [kaiyoti/open-dungeon-raid](https://github.com/kaiyoti/open-dungeon-raid),
+> imported from upstream commit `e81efcf` (upstream history was not carried over). This fork works on
+> making the web build, and the HD build in particular, run better: smoother chain tracing, no
+> hitches, and animation at the display's refresh rate. See [Changes in this fork](#changes-in-this-fork)
+> and [DEVLOG.md](DEVLOG.md). All game design, reverse-engineering and the original rebuild are
+> kaiyoti's work, and everything below this notice describes that project unless it says otherwise.
+
+**▶ Play in your browser (this fork):** [kjcc99.github.io/draid](https://kjcc99.github.io/draid/)
+· [HD version](https://kjcc99.github.io/draid/hd/)
+(GitHub Pages deployment is being set up; see the DEVLOG status table)
+· **Upstream:** [kaiyoti.github.io/open-dungeon-raid](https://kaiyoti.github.io/open-dungeon-raid/)
+· [HD](https://kaiyoti.github.io/open-dungeon-raid/hd/)
+· Android APKs (upstream builds, without this fork's changes): [Releases](https://github.com/kaiyoti/open-dungeon-raid/releases/latest)
 
 > ### Preservation notice
 > This repository is a **game-preservation effort**: the original *Dungeon Raid* is no
@@ -45,20 +56,44 @@ version 1.2.11 (versionCode 14)** — `aapt2 dump badging` on the APK reads
 | `tools/` | build helpers: art dist builder, optional asset setup / HD atlas generation |
 | `fonts/` | Della Respira (SIL OFL 1.1) — bundled fallback for the optional HD font step |
 | `.github/workflows/pages.yml` | deploys the playable builds to GitHub Pages |
+| `DEVLOG.md` | this fork's change log and working notes (status, test and profiling recipes, open ideas) |
 
 ## Play it
 
-* **Online:** <https://kaiyoti.github.io/open-dungeon-raid/> (Original) and
-  <https://kaiyoti.github.io/open-dungeon-raid/hd/> (HD), built from `main` by GitHub Pages
-  (`.github/workflows/pages.yml`).
-* **Android:** download the APKs from the
-  [latest release](https://github.com/kaiyoti/open-dungeon-raid/releases/latest) and sideload them.
+* **Online (this fork):** <https://kjcc99.github.io/draid/> (Original) and
+  <https://kjcc99.github.io/draid/hd/> (HD), built from `master` by GitHub Pages
+  (`.github/workflows/pages.yml`, which triggers on `main` or `master`). Upstream's builds are
+  at <https://kaiyoti.github.io/open-dungeon-raid/> and `/hd/`.
+* **Android:** this fork publishes no APKs yet. Upstream's are in its
+  [latest release](https://github.com/kaiyoti/open-dungeon-raid/releases/latest) (without this
+  fork's changes), or build your own (step 7).
 * **Locally:** serve the repository root and open the art build:
 
 ```bash
 python3 -m http.server 8000
-# then open http://localhost:8000/rebuild/web/demo_art.html
+# then open http://localhost:8000/rebuild/web/demo_art.html     (or demo_art_hd.html)
 ```
+The two HTML pages are build outputs (gitignored), so run step 3 first.
+
+## Changes in this fork
+
+All of these are in `rebuild/web/template.html`, are presentation and input only, and leave
+the game engine untouched. Details, measurements and reasoning are in [DEVLOG.md](DEVLOG.md).
+
+* **No first-trace freeze.** The green chain arrow now tints only its own 64×24 corner of the
+  tile atlas, instead of the whole 4096×4096 HD atlas (which caused a 0.8–4 s stall).
+* **Smooth animation.** Falling tiles, flying tokens, particles, labels, flares and shards are
+  interpolated between the original's fixed 30 Hz steps, so they move at the display's refresh
+  rate. Game timing is unchanged.
+* **Faster board redraw (HD).** Tile sprites are shrunk once to their on-screen size and cached,
+  instead of being downscaled from the HD atlas every frame. Enemy number strips are cached too.
+  One redraw with a chain held went from 4.7 ms to 0.4 ms.
+* **Sound without hitches.** Effects are decoded once with Web Audio and played from memory,
+  instead of creating a new `<audio>` element per sound. Falls back to `<audio>` where Web Audio
+  or Vorbis is unavailable.
+* **More forgiving tracing.** The drag pickup radius is 0.45 cells (was 0.36), and a press made
+  while the board is still settling is held and starts its chain once input opens, instead of
+  being dropped. *These two are deliberate UX departures from strict original behaviour.*
 
 ## Prerequisites (versions this tree is verified with)
 
@@ -84,8 +119,8 @@ that environment's `python3` for the asset tools.)
 ### 1. Get the code
 
 ```bash
-git clone https://github.com/kaiyoti/open-dungeon-raid.git
-cd open-dungeon-raid
+git clone https://github.com/kjcc99/draid.git
+cd draid
 ```
 
 ### 2. Build and test the C++ core
@@ -107,7 +142,9 @@ source /path/to/emsdk/emsdk_env.sh      # emsdk 3.1.74
 ```
 
 Both targets rebuild the wasm (`rebuild/web/dr.js`) from `rebuild/src` + `rebuild/web/api.cpp`
-first, then inline it into the page as one self-contained HTML file. The art atlases are
+first, then inline it into the page as one self-contained HTML file. (`--all` builds both pages.
+`dr.js` is committed, so if you only changed `template.html` you can skip the wasm compile; see
+DEVLOG.md, *Building without Emscripten*.) The art atlases are
 **not** embedded — `demo_art.html` fetches the original game's assets from `assets/ripped/`
 (`demo_art_hd.html` from `assets/ripped-hd/`) relative to the page at runtime.
 
@@ -119,6 +156,14 @@ for t in rebuild/web/test_*.js; do node "$t" || exit 1; done
 
 Node-only tests against the built `rebuild/web/dr.js` and `rebuild/web/template.html`
 (board/rules, save & localStorage guards, menus, HUD, sound, boot order, …).
+Two browser tests also ship, and need Chrome/Chromium plus `pip install websockets`. They
+drive the built `demo_art.html`, so run step 3 first:
+
+```bash
+CHROME=/path/to/chrome python3 rebuild/web/test_u16.py   # drag that starts under a help tip
+CHROME=/path/to/chrome python3 rebuild/web/test_u17.py   # pointer->cell mapping across zoom/DPR
+```
+
 The internal capture-comparison and Chrome screenshot tests are not published here
 (they drive harness scripts and fixtures that read from the original binary).
 
@@ -200,13 +245,18 @@ Add `--hd` after `./tools/make_final.sh --hd` to build the separate HD package
 ### 8. GitHub Pages
 
 `.github/workflows/pages.yml` builds both pages and deploys them (`/` and `/hd/`) with
-pinned action versions; set *Settings → Pages → Source: GitHub Actions*, push, done.
+pinned action versions. Set *Settings → Pages → Source: GitHub Actions* **before** the run.
+A run that starts while Pages is off still builds, but fails at deploy with
+`Failed to create deployment (status: 404)`. In that case, re-run it from
+*Actions → Deploy GitHub Pages → Run workflow*. (Pages on a private repo needs a paid plan.)
 
 ## Credits and licenses
 
 * **Code in this repository** — GNU General Public License v3 **only**
   (SPDX-License-Identifier: **GPL-3.0-only**), Copyright (C) 2026 kaiyoti,
-  see [LICENSE](LICENSE) (full, unmodified GPLv3 text).
+  see [LICENSE](LICENSE) (full, unmodified GPLv3 text). Modifications in this fork
+  (kjcc99/draid, from 2026-10-30, listed in [DEVLOG.md](DEVLOG.md) and the git history)
+  are released under the same licence.
 * **Original *Dungeon Raid* game — code, art, sounds and font tables**
   (`assets/ripped/`, `assets/ripped-hd/`, `sprites.json`): © Fireflame Games / the
   original developer and its licensors. **Not covered by this repository's GPL licence** —
